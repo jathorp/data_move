@@ -63,14 +63,14 @@ graph TD;
         S3 -- "2. Event Notification" --> SQS(fa:fa-list-alt SQS Queue);
         SQS -- "Persistent Failure" --> DLQ(fa:fa-exclamation-triangle Dead-Letter Queue);
 
-        EventBridge(fa:fa-clock EventBridge Rule <br> rate(1 minute)) -- "4. Triggers" --> Lambda;
+        EventBridge("fa:fa-clock EventBridge Rule <br> rate(1 minute)") -- "4. Triggers" --> Lambda;
         Lambda -- "5. Polls messages" --> SQS;
         Lambda -- "6. Downloads files" --> S3;
         SecretsManager(fa:fa-key Secrets Manager) -- "7. Provides credentials" --> Lambda;
     end
-    
+
     Lambda -- "8. Pushes batch via<br>Private Network (TBD)" --> MinIO;
-    
+
     style S3 fill:#f90,stroke:#333,stroke-width:2px
     style SQS fill:#FF4F8B,stroke:#333,stroke-width:2px
     style DLQ fill:#CC0000,stroke:#333,stroke-width:2px
