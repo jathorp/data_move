@@ -74,7 +74,6 @@ graph TD;
     style S3 fill:#f90,stroke:#333,stroke-width:2px
     style SQS fill:#FF4F8B,stroke:#333,stroke-width:2px
     style DLQ fill:#CC0000,stroke:#333,stroke-width:2px
-```
 
 ### 4.3. Design Considerations & Risk Mitigation
 
