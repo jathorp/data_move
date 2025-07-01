@@ -48,34 +48,38 @@ The architecture remains a decoupled, event-driven pipeline. The introduction of
 ### 4.2. Architectural Diagram (v2.1)
 
 ```mermaid
-graph TD;
-    subgraph "On-Premise Data Center"
-        MinIO(fa:fa-hdd MinIO Instance)
-    end
+flowchart TD
+  %% ───────── On-prem DC ─────────
+  subgraph "On-Premise Data Center"
+    MinIO["fa:fa-hdd<br/>MinIO Instance"]
+  end
 
-    subgraph "AWS Cloud (eu-west-2)"
-        subgraph "VPC"
-            Lambda(fa:fa-microchip Aggregator Lambda);
-            style Lambda fill:#FF9900,stroke:#333,stroke-width:2px
-        end
+  %% ───────── AWS Cloud (collapse the VPC level to avoid the bug) ─────────
+  subgraph "AWS Cloud (eu-west-2)"
+    Lambda["fa:fa-microchip<br/>Aggregator Lambda"]
+    ExternalParty["External Party"]
+    S3["fa:fa-database<br/>S3 Bucket"]
+    SQS["fa:fa-list-alt<br/>SQS Queue"]
+    DLQ["fa:fa-exclamation-triangle<br/>Dead-Letter Queue"]
+    EventBridge["fa:fa-clock<br/>EventBridge Rule<br/>rate(1 minute)"]
+    SecretsManager["fa:fa-key<br/>Secrets Manager"]
+  end
 
-        ExternalParty[External Party] -- "1. Uploads files (HTTPS)" --> S3(fa:fa-database S3 Bucket);
-        S3 -- "2. Event Notification" --> SQS(fa:fa-list-alt SQS Queue);
-        SQS -- "Persistent Failure" --> DLQ(fa:fa-exclamation-triangle Dead-Letter Queue);
+  %% ───────── Edges ─────────
+  ExternalParty -->|"1. Uploads files (HTTPS)"| S3
+  S3 -->|"2. Event notification"| SQS
+  SQS -->|"Persistent failure"| DLQ
+  EventBridge -->|"4. Triggers"| Lambda
+  Lambda -->|"5. Polls messages"| SQS
+  Lambda -->|"6. Downloads files"| S3
+  SecretsManager -->|"7. Credentials"| Lambda
+  Lambda -->|"8. Pushes batch (via private network)"| MinIO
 
-        EventBridge("fa:fa-clock EventBridge Rule
-        rate(1 minute)") -- "4. Triggers" --> Lambda;
-        Lambda -- "5. Polls messages" --> SQS;
-        Lambda -- "6. Downloads files" --> S3;
-        SecretsManager(fa:fa-key Secrets Manager) -- "7. Provides credentials" --> Lambda;
-    end
-
-    Lambda -- "8. Pushes batch via
-    Private Network (TBD)" --> MinIO;
-
-    style S3 fill:#f90,stroke:#333,stroke-width:2px
-    style SQS fill:#FF4F8B,stroke:#333,stroke-width:2px
-    style DLQ fill:#CC0000,stroke:#333,stroke-width:2px
+  %% ───────── Styling ─────────
+  style Lambda fill:#FF9900,stroke:#333,stroke-width:2px
+  style S3     fill:#FF9900,stroke:#333,stroke-width:2px
+  style SQS    fill:#FF4F8B,stroke:#333,stroke-width:2px
+  style DLQ    fill:#CC0000,stroke:#333,stroke-width:2px
 ```
 
 ### 4.3. Design Considerations & Risk Mitigation
