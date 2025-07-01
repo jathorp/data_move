@@ -1,20 +1,50 @@
-# aggregator_lambda/core.py
+"""
+Core business logic for the Data Aggregation Pipeline.
+
+These functions are designed to be "pure" and testable, containing no
+direct AWS SDK calls (unless passed in as arguments) and no global state.
+They receive all dependencies, including the Powertools logger, from the main
+handler in app.py, allowing them to be unit-tested in isolation.
+"""
 
 import json
-import logging
-from datetime import datetime, timezone
-from typing import Any, Dict, List
+import random
+import time
+from typing import Dict, List, cast
+from urllib.parse import unquote_plus
 
-import botocore.exceptions
+from aws_lambda_powertools import Logger
+from botocore.exceptions import ClientError
 
-# Corrected: Import shared data classes from the new model.py
-from .model import FilterResult, SQSMessageState
+# Import boto3 stubs for full type-safety in function signatures
+from mypy_boto3_dynamodb.service_resource import Table
+from mypy_boto3_sqs.client import SQSClient
+
+# Import the specific TypeDef required by the delete_message_batch API call.
+from mypy_boto3_sqs.type_defs import DeleteMessageBatchRequestEntryTypeDef
+
+from .model import FilterResult, SQSEventRecord, SQSMessageState
 
 
 def filter_unique_objects(
-    ddb_table: Any, ttl: int, sqs_messages: List[Dict]
+    ddb_table: Table, ttl: int, sqs_messages: List[SQSEventRecord], logger: Logger
 ) -> FilterResult:
-    """Deduplicates S3 keys against DynamoDB using conditional PutItem calls."""
+    """
+    Deduplicates incoming S3 object keys against a DynamoDB table.
+
+    This function implements a three-pass strategy to correctly handle SQS messages
+    that may contain a mix of new and duplicate S3 object records.
+
+    Args:
+        ddb_table: The boto3 DynamoDB Table resource object.
+        ttl: The Unix timestamp for when the idempotency records should expire.
+        sqs_messages: The list of SQS message records from the Lambda event.
+        logger: The Powertools Logger instance for structured logging.
+
+    Returns:
+        A FilterResult dataclass containing the lists of unique keys, messages to
+        process, messages to delete, and a count of duplicates found.
+    """
     message_states: Dict[str, SQSMessageState] = {}
     keys_to_check: Dict[str, List[str]] = {}
 
@@ -24,21 +54,24 @@ def filter_unique_objects(
             body = json.loads(msg["body"])
             records = body.get("Records", [])
             if not records:
+                logger.warning(
+                    "SQS message with no records found.", extra={"messageId": msg_id}
+                )
                 continue
 
             message_states[msg_id] = SQSMessageState(
                 msg=msg, total_records=len(records)
             )
             for record in records:
-                key = record["s3"]["object"]["key"]
+                key = unquote_plus(record["s3"]["object"]["key"])
                 bucket = record["s3"]["bucket"]["name"]
                 object_id = f"{bucket}/{key}"
                 if object_id not in keys_to_check:
                     keys_to_check[object_id] = []
                 keys_to_check[object_id].append(msg_id)
         except (json.JSONDecodeError, KeyError) as e:
-            logging.error(
-                f"Malformed SQS message {msg_id}, will be deleted. Error: {e}"
+            logger.error(
+                "Malformed SQS message.", extra={"messageId": msg_id, "error": str(e)}
             )
             message_states[msg_id] = SQSMessageState(msg=msg, total_records=0)
 
@@ -50,8 +83,11 @@ def filter_unique_objects(
                 ConditionExpression="attribute_not_exists(ObjectID)",
             )
             new_keys_found.add(object_id)
-        except botocore.exceptions.ClientError as e:
-            if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                logger.info(f"Duplicate object key detected: {object_id}")
+            else:
+                logger.exception("Unexpected DynamoDB error during idempotency check.")
                 raise
 
     result = FilterResult()
@@ -75,61 +111,98 @@ def filter_unique_objects(
     return result
 
 
-def delete_sqs_messages(sqs_client: Any, queue_url: str, messages: List[Dict]) -> int:
-    """Deletes messages from SQS. Pure function."""
+def delete_sqs_messages(
+    sqs_client: SQSClient,
+    queue_url: str,
+    messages: List[SQSEventRecord],
+    logger: Logger,
+) -> int:
+    """
+    Deletes a list of messages from SQS, retrying failures with exponential backoff.
+
+    This function deletes messages in batches of 10. If a batch deletion fails
+    partially or completely, it will retry up to 3 times with increasing delays
+    to handle transient network or API errors.
+
+    Args:
+        sqs_client: The boto3 SQS client resource.
+        queue_url: The URL of the SQS queue.
+        messages: A list of SQS message objects to delete.
+        logger: The Powertools Logger instance for structured logging.
+
+    Returns:
+        The total count of messages that ultimately failed to be deleted after all retries.
+    """
     if not messages:
         return 0
-    failed_count = 0
-    to_delete = [
-        {"Id": m["messageId"], "ReceiptHandle": m["receiptHandle"]} for m in messages
-    ]
 
-    for i in range(0, len(to_delete), 10):
-        batch = to_delete[i : i + 10]
-        try:
-            response = sqs_client.delete_message_batch(
-                QueueUrl=queue_url, Entries=batch
-            )
-            if failed := response.get("Failed"):
-                failed_count += len(failed)
-                logging.error(f"Failed to delete SQS messages: {failed}")
-        except botocore.exceptions.ClientError as e:
-            failed_count += len(batch)
-            logging.error(f"Could not delete message batch due to client error: {e}")
+    total_failed_count = 0
+    # Create a dictionary for quick lookup of receipt handles by message ID
+    message_map = {m["messageId"]: m["receiptHandle"] for m in messages}
 
-    return failed_count
+    # Process messages in batches of up to 10, as per the SQS API limit
+    message_ids_to_delete = list(message_map.keys())
+    for i in range(0, len(message_ids_to_delete), 10):
+        batch_ids = message_ids_to_delete[i : i + 10]
 
-
-def emit_metrics(environment: str, status: str, payload: Dict):
-    """Formats and logs metrics in CloudWatch Embedded Metric Format (EMF)."""
-    base_metrics = {
-        "FilesProcessed": payload.get("source_files", 0),
-        "DuplicateFilesSkipped": payload.get("duplicates_skipped", 0),
-        "DeleteFailures": payload.get("delete_failures", 0),
-    }
-    if "latency_ms" in payload:
-        base_metrics["ProcessingLatencyMs"] = payload["latency_ms"]
-
-    emf_payload = {
-        "_aws": {
-            "Timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
-            "CloudWatchMetrics": [
-                {
-                    "Namespace": "DataMovePipeline",
-                    "Dimensions": [["Environment"]],
-                    "Metrics": [
-                        {
-                            "Name": k,
-                            "Unit": "Milliseconds" if "Latency" in k else "Count",
-                        }
-                        for k in base_metrics.keys()
-                    ],
-                }
+        # Build the batch entries for the API call
+        # This list will shrink on each successful partial deletion
+        entries_to_delete = cast(
+            List[DeleteMessageBatchRequestEntryTypeDef],
+            [
+                {"Id": msg_id, "ReceiptHandle": message_map[msg_id]}
+                for msg_id in batch_ids
             ],
-        },
-        "Environment": environment,
-        "Status": status,
-        **base_metrics,
-        **payload,
-    }
-    logging.info(json.dumps(emf_payload))
+        )
+
+        # Retry loop for the current batch
+        for attempt in range(3):  # Attempt up to 3 times
+            try:
+                response = sqs_client.delete_message_batch(
+                    QueueUrl=queue_url, Entries=entries_to_delete
+                )
+
+                if failed_batch := response.get("Failed"):
+                    logger.warning(
+                        "Partial failure in SQS delete batch.",
+                        extra={
+                            "attempt": attempt + 1,
+                            "failed_messages": failed_batch,
+                        },
+                    )
+                    # Rebuild the list of entries to retry with only the failed ones
+                    failed_ids = {f["Id"] for f in failed_batch}
+                    entries_to_delete = [
+                        e for e in entries_to_delete if e["Id"] in failed_ids
+                    ]
+                else:
+                    # Success: the entire batch was deleted
+                    logger.info(
+                        f"Successfully deleted {len(batch_ids)} SQS messages in batch."
+                    )
+                    entries_to_delete.clear()  # Empty the list to signify success
+                    break  # Exit the retry loop for this batch
+
+            except ClientError as e:
+                logger.error(
+                    "ClientError on SQS delete_message_batch.",
+                    extra={"error": str(e), "attempt": attempt + 1},
+                )
+                # Let the loop continue to the next attempt
+
+            # If we are here, it means the attempt failed. Wait before retrying.
+            # Exponential backoff with jitter: 0.2s, 0.4s, 0.8s + random jitter
+            wait_time = (0.2 * (2**attempt)) + random.uniform(0.0, 0.1)
+            logger.info(f"Waiting {wait_time:.2f}s before SQS delete retry.")
+            time.sleep(wait_time)
+
+        # After all retries, any remaining entries in the list are permanent failures
+        if entries_to_delete:
+            final_failed_count = len(entries_to_delete)
+            logger.critical(
+                f"{final_failed_count} messages failed to be deleted after all retries.",
+                extra={"failed_ids": [e["Id"] for e in entries_to_delete]},
+            )
+            total_failed_count += final_failed_count
+
+    return total_failed_count
