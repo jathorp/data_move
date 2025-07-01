@@ -55,7 +55,7 @@ flowchart TD
   end
   subgraph "AWS Cloud (eu-west-2)"
     Lambda["fa:fa-microchip<br/>Aggregator Lambda"]
-    ExternalParty["External Party"]
+    ExternalParty["External Party"] 
     S3["fa:fa-database<br/>S3 Bucket"]
     SQS["fa:fa-list-alt<br/>SQS Queue"]
     DLQ["fa:fa-exclamation-triangle<br/>Dead-Letter Queue"]
