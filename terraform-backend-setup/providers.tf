@@ -1,4 +1,4 @@
-# File: providers.tf
+# File: 1-terraform-backend-setup/providers.tf
 
 terraform {
   required_providers {

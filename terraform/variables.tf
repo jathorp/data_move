@@ -12,18 +12,14 @@ variable "environment" {
   default     = "dev"
 }
 
-variable "aws_region_code" {
-  description = "The short code for the AWS region (e.g., 'euw2')."
+variable "aws_region" {
+  description = "The full AWS region string where resources will be deployed (e.g., 'eu-west-2')."
   type        = string
-  default     = "euw2"
+  default     = "eu-west-2"
 }
 
 variable "tags" {
-  description = "A map of tags to apply to all resources."
+  description = "A map of tags to apply to all resources. Add CostCenter or Owner as needed."
   type        = map(string)
-  default = {
-    Project     = "Data Move Pipeline"
-    ManagedBy   = "Terraform"
-    Environment = "Dev"
-  }
+  # No default makes this a required input, forcing environment-specific tagging.
 }
