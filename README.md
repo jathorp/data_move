@@ -49,12 +49,10 @@ The architecture remains a decoupled, event-driven pipeline. The introduction of
 
 ```mermaid
 flowchart TD
-  %% ───────── On-prem DC ─────────
+  %% ───────── Nodes ─────────
   subgraph "On-Premise Data Center"
     MinIO["fa:fa-hdd<br/>MinIO Instance"]
   end
-
-  %% ───────── AWS Cloud (collapse the VPC level to avoid the bug) ─────────
   subgraph "AWS Cloud (eu-west-2)"
     Lambda["fa:fa-microchip<br/>Aggregator Lambda"]
     ExternalParty["External Party"]
@@ -66,14 +64,14 @@ flowchart TD
   end
 
   %% ───────── Edges ─────────
-  ExternalParty -->|"1. Uploads files (HTTPS)"| S3
-  S3 -->|"2. Event notification"| SQS
-  SQS -->|"Persistent failure"| DLQ
-  EventBridge -->|"4. Triggers"| Lambda
-  Lambda -->|"5. Polls messages"| SQS
-  Lambda -->|"6. Downloads files"| S3
-  SecretsManager -->|"7. Credentials"| Lambda
-  Lambda -->|"8. Pushes batch (via private network)"| MinIO
+  ExternalParty -->|"1\. Uploads files (HTTPS)"| S3
+  S3            -->|"2\. Event notification"| SQS
+  SQS           -->|"3\. Persistent failure"| DLQ
+  EventBridge   -->|"4\. Triggers"| Lambda
+  Lambda        -->|"5\. Polls messages"| SQS
+  Lambda        -->|"6\. Downloads files"| S3
+  SecretsManager-->|"7\. Provides credentials"| Lambda
+  Lambda        -->|"8\. Pushes batch (via private network)"| MinIO
 
   %% ───────── Styling ─────────
   style Lambda fill:#FF9900,stroke:#333,stroke-width:2px
