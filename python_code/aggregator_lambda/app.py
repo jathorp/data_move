@@ -12,6 +12,7 @@ Its responsibilities include:
 """
 
 import hashlib
+import io
 import json
 import logging
 import os
@@ -25,6 +26,8 @@ from typing import Any, Dict, Optional
 
 import boto3
 from botocore.client import BaseClient
+# FIX: Import ClientError directly from botocore for correct exception handling.
+from botocore.exceptions import ClientError
 
 from . import clients, core
 from .clients import BOTO_CONFIG_RETRYABLE
@@ -32,19 +35,7 @@ from .clients import BOTO_CONFIG_RETRYABLE
 # --- 1. SETUP: Configuration, Validation, and Clients ---
 
 def get_env_var(name: str, default: Optional[str] = None) -> str:
-    """
-    Gets an environment variable or raises a ValueError for fast-failure.
-
-    Args:
-        name: The name of the environment variable.
-        default: An optional default value. If not provided, the variable is required.
-
-    Returns:
-        The value of the environment variable.
-
-    Raises:
-        ValueError: If the required environment variable is not set.
-    """
+    """Gets an environment variable or raises a ValueError for fast-failure."""
     value = os.environ.get(name, default)
     if value is None:
         raise ValueError(f"FATAL: Environment variable '{name}' is not set.")
@@ -61,17 +52,19 @@ LOG_LEVEL = get_env_var("LOG_LEVEL", "INFO").upper()
 IDEMPOTENCY_TTL_HOURS = int(get_env_var("IDEMPOTENCY_TTL_HOURS", "24"))
 SECRET_CACHE_TTL_SECONDS = int(get_env_var("SECRET_CACHE_TTL_SECONDS", "300"))
 MINIO_SSE_TYPE = get_env_var("MINIO_SSE_TYPE", "AES256")
-# Default raised to 32 to better handle 100 files/sec burst requirement (NFR-05).
 MAX_FETCH_WORKERS = int(get_env_var("MAX_FETCH_WORKERS", "32"))
 QUEUE_DEPTH_FACTOR = int(get_env_var("QUEUE_DEPTH_FACTOR", "4"))
-SPOOL_MAX_MEMORY_BYTES = int(get_env_var("SPOOL_MAX_MEMORY_BYTES", "104857600"))
+SPOOL_MAX_MEMORY_BYTES = int(get_env_var("SPOOL_MAX_MEMORY_BYTES", "268435456")) # 256 MiB
 ARCHIVE_TIMEOUT_SECONDS = int(get_env_var("ARCHIVE_TIMEOUT_SECONDS", "300"))
-# Default raised to 5s to be more resilient to transient writer slowdowns (NFR-02).
 QUEUE_PUT_TIMEOUT_SECONDS = int(get_env_var("QUEUE_PUT_TIMEOUT_SECONDS", "5"))
+MIN_REMAINING_TIME_MS = int(get_env_var("MIN_REMAINING_TIME_MS", "60000")) # 60 seconds
+MAX_FILE_SIZE_BYTES = int(get_env_var("MAX_FILE_SIZE_BYTES", "5242880")) # 5 MiB
 
 # --- Global Setup ---
 logger = logging.getLogger()
 logger.setLevel(LOG_LEVEL)
+logging.getLogger("boto3").setLevel(logging.WARNING)
+logging.getLogger("botocore").setLevel(logging.WARNING)
 
 S3, SQS, DDB, SECRETS = clients.get_boto_clients()
 
@@ -80,7 +73,7 @@ MINIO_SECRET_CACHE = {"data": None, "timestamp": datetime.min.replace(tzinfo=tim
 
 # --- 2. STATEFUL & ORCHESTRATION LOGIC ---
 
-class HashingStreamWrapper:
+class ArchiveHasher:
     """Wraps a file-like object to compute a SHA256 hash on the fly as it is being read."""
     def __init__(self, stream):
         self._stream = stream
@@ -95,22 +88,7 @@ class HashingStreamWrapper:
         return self._hasher.hexdigest()
 
 def get_minio_client(force_refresh: bool = False) -> BaseClient:
-    """
-    Retrieves a MinIO S3 client, using a time-based cache for credentials.
-
-    This function manages the stateful, cached MinIO client. It's kept in this
-    module because its lifecycle is tied to the Lambda execution environment.
-
-    Args:
-        force_refresh: If True, bypasses the cache and fetches new credentials.
-                       Used for retrying after an authentication failure.
-
-    Returns:
-        A boto3 S3 client configured for the MinIO endpoint.
-
-    Raises:
-        botocore.exceptions.ClientError: If retrieving the secret from Secrets Manager fails.
-    """
+    """Retrieves a MinIO S3 client, using a time-based cache for credentials."""
     global MINIO, MINIO_SECRET_CACHE
     now = datetime.now(timezone.utc)
     cache_expiry = MINIO_SECRET_CACHE["timestamp"] + timedelta(seconds=SECRET_CACHE_TTL_SECONDS)
@@ -128,67 +106,64 @@ def get_minio_client(force_refresh: bool = False) -> BaseClient:
 def stream_archive_to_minio(s3_keys: list[str], dest_key: str) -> str:
     """
     Streams files from S3, creates a tar.gz archive in-memory, uploads to MinIO,
-    and verifies the integrity of the uploaded object to satisfy REQ-05.
-
-    This function uses a thread-safe producer-consumer pattern to achieve parallelism.
-    - Producers (fetchers): A thread pool fetches S3 objects concurrently.
-    - Consumer (writer): A single thread writes objects to the tar archive.
-
-    To prevent deadlocks from back-pressure, producers use a short timeout when
-    putting items onto the queue. If the queue is full, they inject an error and
-    stop, causing the entire batch to fail fast and be retried by SQS.
-    A sentinel value (`None`) is used to signal completion.
-
-    The integrity check is a two-pass process on the in-memory archive:
-    1. The entire archive is built and its SHA256 checksum is computed.
-    2. The archive is streamed again for upload, with the checksum attached as
-       metadata. A final `head_object` call verifies this metadata on the
-       object in MinIO.
-
-    Args:
-        s3_keys: A list of S3 object keys to include in the archive.
-        dest_key: The destination key for the archive in the MinIO bucket.
-
-    Returns:
-        The hex digest of the SHA256 checksum of the created archive.
+    and verifies the integrity of the uploaded object.
     """
     data_queue: queue.Queue = queue.Queue(maxsize=MAX_FETCH_WORKERS * QUEUE_DEPTH_FACTOR)
     error_queue: queue.Queue = queue.Queue()
+    error_event = threading.Event()
 
     def _fetcher(key: str):
+        """Producer: Fetches an S3 object and puts its buffered content on the queue."""
         try:
             s3_obj = S3.get_object(Bucket=LANDING_BUCKET, Key=key)
-            data_queue.put((key, s3_obj["Body"], s3_obj["ContentLength"]), timeout=QUEUE_PUT_TIMEOUT_SECONDS)
+            content_length = s3_obj["ContentLength"]
+            if content_length > MAX_FILE_SIZE_BYTES:
+                raise ValueError(f"File {key} ({content_length} bytes) exceeds max size of {MAX_FILE_SIZE_BYTES} bytes.")
+
+            with s3_obj["Body"] as stream:
+                buffered_body = io.BytesIO(stream.read())
+
+            data_queue.put((key, buffered_body), timeout=QUEUE_PUT_TIMEOUT_SECONDS)
         except queue.Full:
             err = RuntimeError(f"Queue full while fetching {key}; writer may be stalled.")
             error_queue.put(err)
-            logger.error(err)
+            error_event.set()
         except Exception as e:
             logger.exception(f"Fetcher thread failed for key {key}")
             error_queue.put(e)
+            error_event.set()
 
     def _writer(spooled_file: tempfile.SpooledTemporaryFile):
+        """Consumer: Pulls from queue and writes to the tar archive."""
         try:
             with tarfile.open(fileobj=spooled_file, mode="w:gz") as tar:
-                while True:
-                    item = data_queue.get()
-                    if item is None: break
-                    key, body, size = item
-                    with body:
+                while not error_event.is_set():
+                    try:
+                        item = data_queue.get(block=True, timeout=0.1)
+                        if item is None: break
+                        key, body = item
                         tarinfo = tarfile.TarInfo(name=key)
-                        tarinfo.size = size
+                        tarinfo.size = len(body.getbuffer())
+                        body.seek(0)
                         tar.addfile(tarinfo, body)
+                    except queue.Empty:
+                        continue
         except Exception as e:
             logger.exception("Writer thread failed")
             error_queue.put(e)
+            error_event.set()
 
     with tempfile.SpooledTemporaryFile(max_size=SPOOL_MAX_MEMORY_BYTES, mode='w+b') as spooled_archive:
         writer_thread = threading.Thread(target=_writer, args=(spooled_archive,))
         writer_thread.start()
         with ThreadPoolExecutor(max_workers=MAX_FETCH_WORKERS) as executor:
             for s3_key in s3_keys:
+                if error_event.is_set(): break
                 executor.submit(_fetcher, s3_key)
-        data_queue.put(None)
+
+        if not error_event.is_set():
+            data_queue.put(None)
+
         writer_thread.join(timeout=ARCHIVE_TIMEOUT_SECONDS)
 
         if not error_queue.empty(): raise error_queue.get()
@@ -198,55 +173,49 @@ def stream_archive_to_minio(s3_keys: list[str], dest_key: str) -> str:
              logger.warning(f"Archive size exceeded {SPOOL_MAX_MEMORY_BYTES} bytes; spooled to disk.")
              core.emit_metrics(ENVIRONMENT, "Info", {"ArchiveSpilled": 1})
 
-        # --- Data Integrity Check (REQ-05) ---
-        # Pass 1: Calculate the SHA256 checksum of the completed archive.
-        spooled_archive.seek(0)
-        sha256 = hashlib.sha256()
-        while chunk := spooled_archive.read(8192):
-            sha256.update(chunk)
-        digest = sha256.hexdigest()
+        # Manual retry loop for authentication errors.
+        for attempt in range(2):
+            try:
+                spooled_archive.seek(0)
+                hasher = ArchiveHasher(spooled_archive)
 
-        # Pass 2: Upload the file with the checksum as metadata.
-        spooled_archive.seek(0)
-        minio_client = get_minio_client()
-        extra_args = {
-            "ServerSideEncryption": MINIO_SSE_TYPE if MINIO_SSE_TYPE != "NONE" else None,
-            "Metadata": {"sha256_checksum": digest}
-        }
-        minio_client.upload_fileobj(spooled_archive, MINIO_BUCKET, dest_key, ExtraArgs={k: v for k, v in extra_args.items() if v is not None})
+                minio_client = get_minio_client(force_refresh=(attempt > 0))
 
-        # Verification step: Ensure the object in MinIO has the correct checksum.
-        head = minio_client.head_object(Bucket=MINIO_BUCKET, Key=dest_key)
-        remote_checksum = head.get("Metadata", {}).get("sha256_checksum")
-        if remote_checksum != digest:
-            raise RuntimeError(f"Checksum mismatch for {dest_key}: local={digest}, remote={remote_checksum}")
+                extra_args = {}
+                if MINIO_SSE_TYPE != "NONE":
+                    extra_args["ServerSideEncryption"] = MINIO_SSE_TYPE
 
-        logger.info(f"Successfully uploaded and verified checksum for {dest_key}")
-        return digest
+                minio_client.upload_fileobj(hasher, MINIO_BUCKET, dest_key, ExtraArgs=extra_args)
+                digest = hasher.hexdigest()
+
+                minio_client.copy_object(
+                    Bucket=MINIO_BUCKET, Key=dest_key, CopySource={"Bucket": MINIO_BUCKET, "Key": dest_key},
+                    Metadata={"sha256_checksum": digest}, MetadataDirective="REPLACE",
+                    **extra_args
+                )
+                head = minio_client.head_object(Bucket=MINIO_BUCKET, Key=dest_key)
+                remote_checksum = head.get("Metadata", {}).get("sha256_checksum")
+                if remote_checksum != digest:
+                    raise RuntimeError(f"Checksum mismatch for {dest_key}: local={digest}, remote={remote_checksum}")
+
+                logger.info(f"Successfully uploaded and verified checksum for {dest_key}")
+                return digest
+
+            # FIX: Use the correct, imported ClientError class.
+            except ClientError as e:
+                if e.response["Error"]["Code"] in ["AccessDenied", "InvalidAccessKeyId"] and attempt == 0:
+                    logger.warning("MinIO access denied. Forcing secret refresh and retrying.")
+                    continue
+                raise
+    raise RuntimeError("Failed to upload archive to MinIO after all attempts.")
 
 def _build_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
-    """Centralized helper to build the final Lambda response."""
     return {"statusCode": status_code, "body": json.dumps(body)}
 
 # --- 3. LAMBDA HANDLER ---
 
 def handler(event: Dict, context: Any):
-    """
-    Main Lambda entry point. Orchestrates the entire aggregation process.
-
-    This function is triggered by a batch of SQS messages and returns a
-    dictionary for logging and unit testing convenience. It does not integrate
-    with API Gateway. It will re-raise exceptions to let SQS handle retries.
-
-    This function follows these steps:
-    1. Fetches current queue depth and emits a metric (NFR-07).
-    2. Receives a batch of SQS messages.
-    3. Calls `core.filter_unique_objects` to perform idempotency checks.
-    4. Deletes SQS messages corresponding to duplicate files.
-    5. If new files exist, calls `stream_archive_to_minio` to process them.
-    6. On successful upload, deletes SQS messages for the processed files.
-    7. Emits success or failure metrics.
-    """
+    """Main Lambda entry point. Orchestrates the entire aggregation process."""
     start_time = datetime.now(timezone.utc)
     sqs_messages = event.get("Records", [])
     if not sqs_messages:
@@ -255,13 +224,15 @@ def handler(event: Dict, context: Any):
     logger.info(f"Received {len(sqs_messages)} messages to process.")
 
     try:
-        # Emit queue depth metric for observability (NFR-07).
         try:
             attrs = SQS.get_queue_attributes(QueueUrl=QUEUE_URL, AttributeNames=["ApproximateNumberOfMessages"])
             queue_depth = int(attrs.get("Attributes", {}).get("ApproximateNumberOfMessages", 0))
             core.emit_metrics(ENVIRONMENT, "Info", {"QueueDepth": queue_depth})
         except Exception as e:
             logger.warning(f"Could not get queue attributes: {e}")
+
+        if context.get_remaining_time_in_millis() < MIN_REMAINING_TIME_MS:
+            raise TimeoutError("Not enough time remaining to process batch; re-queuing.")
 
         table = DDB.Table(IDEMPOTENCY_TABLE)
         ttl = int((datetime.now(timezone.utc) + timedelta(hours=IDEMPOTENCY_TTL_HOURS)).timestamp())
